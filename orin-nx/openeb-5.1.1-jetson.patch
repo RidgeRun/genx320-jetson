@@ -1952,3 +1952,218 @@ index 0000000..1c65f17
 +echo
 +echo "Run on Jetson:"
 +echo "MV_HAL_PLUGIN_PATH=$REMOTE_PLUGIN_DIR metavision_viewer"
+
+diff --git a/hal_psee_plugins/include/boards/v4l2/v4l2_device.h b/hal_psee_plugins/include/boards/v4l2/v4l2_device.h
+index 8d0b8d0..0000000 100644
+--- a/hal_psee_plugins/include/boards/v4l2/v4l2_device.h
++++ b/hal_psee_plugins/include/boards/v4l2/v4l2_device.h
+@@ -41,6 +41,8 @@ class V4L2DeviceControl : public DeviceControl {
+     int media_fd_ = -1;
+     std::vector<media_entity> entities_;
+     std::shared_ptr<V4L2Controls> controls_;
++    std::string selected_sensor_;
++    void refresh_selected_entities();
+ 
+ public:
+     /* Count the number of bytes received in the buffer. The complexity is log(n) */
+@@ -57,6 +59,8 @@ public:
+     V4L2DeviceControl(const std::string &dev_name);
+     virtual ~V4L2DeviceControl() = default;
+ 
++    bool has_sensor_entity(const std::string &sensor_name) const;
++    bool select_sensor_entity(const std::string &sensor_name);
+     V4l2Capability get_capability() const;
+     const struct media_entity *get_sensor_entity() const;
+     const struct media_entity *get_video_entity() const;
+diff --git a/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_board_command.h b/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_board_command.h
+index 256f5a0..0000000 100644
+--- a/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_board_command.h
++++ b/hal_psee_plugins/psee_hw_layer_headers/include/metavision/psee_hw_layer/boards/v4l2/v4l2_board_command.h
+@@ -48,6 +48,9 @@ public:
+     std::string get_manufacturer() override;
+     time_t get_build_date() override;
+     uint32_t get_version() override;
++    
++    bool has_sensor(const std::string &sensor_name) const;
++    bool select_sensor(const std::string &sensor_name);
+ 
+     uint32_t get_device_count() override;
+     std::vector<uint32_t> read_device_register(uint32_t device, uint32_t address, int nval = 1) override;
+diff --git a/hal_psee_plugins/src/boards/v4l2/v4l2_board_command.cpp b/hal_psee_plugins/src/boards/v4l2/v4l2_board_command.cpp
+index 8c81652..0000000 100644
+--- a/hal_psee_plugins/src/boards/v4l2/v4l2_board_command.cpp
++++ b/hal_psee_plugins/src/boards/v4l2/v4l2_board_command.cpp
+@@ -74,6 +74,19 @@ std::string V4L2BoardCommand::get_serial() {
+     return serial;
+ }
+ 
++bool V4L2BoardCommand::has_sensor(const std::string &sensor_name) const {
++    return device_->has_sensor_entity(sensor_name);
++}
++
++bool V4L2BoardCommand::select_sensor(const std::string &sensor_name) {
++    if (!device_->select_sensor_entity(sensor_name)) {
++        return false;
++    }
++
++    serial = device_->get_sensor_entity()->desc.name;
++    return true;
++}
++
+ // TODO: keep it internal in tz (libusb) board command, and expose generic
+ // functions allowing to cover all use cases (v4l2, usb, ethernet, whatever).
+ void V4L2BoardCommand::transfer_tz_frame(TzCtrlFrame &req) {}
+diff --git a/hal_psee_plugins/src/boards/v4l2/v4l2_camera_discovery.cpp b/hal_psee_plugins/src/boards/v4l2/v4l2_camera_discovery.cpp
+index 66f0ac6..0000000 100644
+--- a/hal_psee_plugins/src/boards/v4l2/v4l2_camera_discovery.cpp
++++ b/hal_psee_plugins/src/boards/v4l2/v4l2_camera_discovery.cpp
+@@ -78,14 +78,24 @@ bool V4l2CameraDiscovery::discover(DeviceBuilder &device_builder, const std::str
+     }
+ 
+     size_t n_devices  = devices_.size();
+     size_t dev_select = 0;
++    bool found        = serial.empty();
+ 
+     for (size_t i = 0; i < n_devices; ++i) {
+-        if (devices_[i]->get_serial() == serial) {
++        if (devices_[i]->get_serial() == serial || devices_[i]->has_sensor(serial)) {
+             dev_select = i;
++            found      = true;
++            break;
+         }
+     }
+ 
++    if (!found) {
++        MV_HAL_LOG_TRACE() << "V4l2Discovery could not find requested serial '" << serial << "'";
++        return false;
++    }
++
++    devices_[dev_select]->select_sensor(serial);
++
+     MV_HAL_LOG_TRACE() << "V4l2Discovery requested serial='" << serial << "', selected candidate index " << dev_select
+                        << " with serial '" << devices_[dev_select]->get_serial() << "'";
+ 
+     auto res = false;
+diff --git a/hal_psee_plugins/src/boards/v4l2/v4l2_device.cpp b/hal_psee_plugins/src/boards/v4l2/v4l2_device.cpp
+index 45a0ab6..0000000 100644
+--- a/hal_psee_plugins/src/boards/v4l2/v4l2_device.cpp
++++ b/hal_psee_plugins/src/boards/v4l2/v4l2_device.cpp
+@@ -76,29 +76,7 @@ V4L2DeviceControl::V4L2DeviceControl(const std::string &devpath) {
+ 
+     enumerate_entities();
+ 
+-    auto video_ent = get_video_entity();
+-
+-    if (ioctl(video_ent->fd, VIDIOC_QUERYCAP, &cap_)) {
+-        throw HalConnectionException(errno, std::generic_category(), "VIDIOC_QUERYCAP failed");
+-    }
+-
+-    if (cap_.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
+-        buf_type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
+-    } else if (cap_.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
+-        buf_type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+-    } else {
+-        throw HalConnectionException(ENOTSUP, std::generic_category(), devpath + " is not video capture device");
+-    }
+-
+-    if (!(cap_.capabilities & V4L2_CAP_STREAMING)) {
+-        throw HalConnectionException(ENOTSUP, std::generic_category(), devpath + " does not support streaming i/o");
+-    }
+-
+-    MV_HAL_LOG_TRACE() << "Opened V4L2 media device '" << devpath << "' driver='" << cap_.driver << "' card='"
+-                       << cap_.card << "' bus='" << cap_.bus_info << "'";
+-
+-    // only expose sensor controls for now
+-    controls_ = std::make_shared<V4L2Controls>(get_sensor_entity()->fd);
++    refresh_selected_entities();
+     MV_HAL_LOG_TRACE() << "Selected sensor entity '" << get_sensor_entity()->desc.name << "' at "
+                        << get_sensor_entity()->path << " and video entity '" << get_video_entity()->desc.name << "' at "
+                        << get_video_entity()->path;
+@@ -196,9 +175,65 @@ V4l2Capability V4L2DeviceControl::get_capability() const {
+     return cap_;
+ }
+ 
++bool V4L2DeviceControl::has_sensor_entity(const std::string &sensor_name) const {
++    return std::any_of(entities_.begin(), entities_.end(), [&](const auto &entity) {
++        return entity.type == MEDIA_ENT_T_V4L2_SUBDEV_SENSOR && std::string(entity.desc.name) == sensor_name;
++    });
++}
++
++bool V4L2DeviceControl::select_sensor_entity(const std::string &sensor_name) {
++    if (sensor_name.empty()) {
++        selected_sensor_.clear();
++        refresh_selected_entities();
++        return true;
++    }
++
++    if (!has_sensor_entity(sensor_name)) {
++        return false;
++    }
++
++    selected_sensor_ = sensor_name;
++    refresh_selected_entities();
++    MV_HAL_LOG_TRACE() << "Selected sensor entity '" << get_sensor_entity()->desc.name << "' at "
++                       << get_sensor_entity()->path << " and video entity '" << get_video_entity()->desc.name << "' at "
++                       << get_video_entity()->path;
++    return true;
++}
++
++void V4L2DeviceControl::refresh_selected_entities() {
++    auto video_ent = get_video_entity();
++
++    if (ioctl(video_ent->fd, VIDIOC_QUERYCAP, &cap_)) {
++        throw HalConnectionException(errno, std::generic_category(), "VIDIOC_QUERYCAP failed");
++    }
++
++    if (cap_.capabilities & V4L2_CAP_VIDEO_CAPTURE_MPLANE) {
++        buf_type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
++    } else if (cap_.capabilities & V4L2_CAP_VIDEO_CAPTURE) {
++        buf_type_ = V4L2_BUF_TYPE_VIDEO_CAPTURE;
++    } else {
++        throw HalConnectionException(ENOTSUP, std::generic_category(), get_video_entity()->path.string() +
++                                                                     " is not video capture device");
++    }
++
++    if (!(cap_.capabilities & V4L2_CAP_STREAMING)) {
++        throw HalConnectionException(ENOTSUP, std::generic_category(), get_video_entity()->path.string() +
++                                                                     " does not support streaming i/o");
++    }
++
++    MV_HAL_LOG_TRACE() << "Opened V4L2 video entity '" << video_ent->desc.name << "' at " << video_ent->path
++                       << " driver='" << cap_.driver << "' card='" << cap_.card << "' bus='" << cap_.bus_info << "'";
++
++    controls_ = std::make_shared<V4L2Controls>(get_sensor_entity()->fd);
++}
++
+ const struct media_entity *V4L2DeviceControl::get_sensor_entity() const {
+-    auto sensor = std::find_if(entities_.begin(), entities_.end(),
+-                               [](const auto &entity) { return entity.type == MEDIA_ENT_T_V4L2_SUBDEV_SENSOR; });
++    auto sensor = std::find_if(entities_.begin(), entities_.end(), [&](const auto &entity) {
++        if (entity.type != MEDIA_ENT_T_V4L2_SUBDEV_SENSOR) {
++            return false;
++        }
++        return selected_sensor_.empty() || std::string(entity.desc.name) == selected_sensor_;
++    });
+ 
+     if (sensor == entities_.end()) {
+         throw HalConnectionException(ENODEV, std::generic_category(), "Could not find a v4l2 sensor subdevice");
+@@ -209,8 +244,17 @@ const struct media_entity *V4L2DeviceControl::get_sensor_entity() const {
+ }
+ 
+ const struct media_entity *V4L2DeviceControl::get_video_entity() const {
+-    auto video = std::find_if(entities_.begin(), entities_.end(),
+-                              [](const auto &entity) { return entity.type == MEDIA_ENT_T_DEVNODE_V4L; });
++    auto video = std::find_if(entities_.begin(), entities_.end(), [&](const auto &entity) {
++        if (entity.type != MEDIA_ENT_T_DEVNODE_V4L) {
++            return false;
++        }
++
++        if (selected_sensor_.empty()) {
++            return true;
++        }
++
++        return std::string(entity.desc.name).find(selected_sensor_) != std::string::npos;
++    });
+ 
+     if (video == entities_.end()) {
+         throw HalConnectionException(ENODEV, std::generic_category(), "Could not find a v4l2 video device");
